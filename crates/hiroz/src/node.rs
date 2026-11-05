@@ -534,7 +534,6 @@ impl ZNode {
         type_hash: &str,
         qos: Option<crate::qos::QosProfile>,
     ) -> Result<RawPublisher> {
-        use zenoh::qos::CongestionControl;
         use zenoh_ext::AdvancedPublisherBuilderExt;
 
         use crate::{
@@ -567,7 +566,7 @@ impl ZNode {
         let publisher = self
             .session
             .declare_publisher((*topic_ke).clone())
-            .congestion_control(CongestionControl::Block)
+            .congestion_control(crate::pubsub::congestion_control_for(&entity.qos))
             .advanced();
         let publisher = apply_transient_local_pub(publisher, &entity.qos).wait()?;
 

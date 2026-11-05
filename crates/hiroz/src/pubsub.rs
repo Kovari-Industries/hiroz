@@ -36,6 +36,21 @@ const SAMPLE_MISS_HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
 /// truncation surprises inside zenoh-ext's internal `as_millis()` paths).
 const TRANSIENT_LOCAL_QUERY_TIMEOUT: Duration = Duration::from_millis(u64::MAX);
 
+/// Zenoh congestion control for a publisher with this QoS.
+///
+/// Matches rmw_zenoh_cpp (`rmw_publisher_data.cpp`): a publisher blocks only when it is
+/// RELIABLE and KEEP_ALL. Every other profile drops when the transmit queue is full, so a
+/// slow subscriber (for example a remote client behind the router) cannot stall the
+/// publisher or other subscribers of the same router.
+pub(crate) fn congestion_control_for(
+    qos: &hiroz_protocol::qos::QosProfile,
+) -> zenoh::qos::CongestionControl {
+    match (qos.reliability, qos.history) {
+        (QosReliability::Reliable, QosHistory::KeepAll) => zenoh::qos::CongestionControl::Block,
+        _ => zenoh::qos::CongestionControl::Drop,
+    }
+}
+
 fn cache_depth_from_history(history: QosHistory) -> usize {
     // Mirrors rmw_zenoh_cpp's `QoS::best_available_qos` (`qos.cpp:107`):
     // a zero-valued depth (the rmw representation of "unspecified" or
@@ -322,17 +337,13 @@ where
         // Map QoS to Zenoh publisher settings
         let mut pub_builder = self.session.declare_publisher(key_expr);
 
-        // Map reliability: Reliable uses Block, BestEffort uses Drop
-        match self.entity.qos.reliability {
-            QosReliability::Reliable => {
-                pub_builder = pub_builder.congestion_control(zenoh::qos::CongestionControl::Block);
-                debug!("[PUB] QoS: Reliable (Block)");
-            }
-            QosReliability::BestEffort => {
-                pub_builder = pub_builder.congestion_control(zenoh::qos::CongestionControl::Drop);
-                debug!("[PUB] QoS: BestEffort (Drop)");
-            }
-        }
+        // Congestion control follows rmw_zenoh_cpp: Block only for Reliable + KeepAll.
+        let congestion = congestion_control_for(&self.entity.qos);
+        pub_builder = pub_builder.congestion_control(congestion);
+        debug!(
+            "[PUB] QoS: {:?} {:?} -> {:?}",
+            self.entity.qos.reliability, self.entity.qos.history, congestion
+        );
 
         // Build an AdvancedPublisher and apply TransientLocal config if needed.
         let pub_builder = pub_builder.advanced();
@@ -1230,6 +1241,58 @@ impl ZSub<crate::dynamic::DynamicMessage, Sample, crate::dynamic::DynamicSerdeCd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Congestion control matches rmw_zenoh_cpp (Block only for Reliable + KeepAll)
+    // -----------------------------------------------------------------------
+
+    fn proto_qos(
+        reliability: QosReliability,
+        history: QosHistory,
+    ) -> hiroz_protocol::qos::QosProfile {
+        hiroz_protocol::qos::QosProfile {
+            reliability,
+            history,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_congestion_reliable_keep_last_drops() {
+        use zenoh::qos::CongestionControl;
+        for depth in [1, 10, 100] {
+            let qos = proto_qos(QosReliability::Reliable, QosHistory::KeepLast(depth));
+            assert_eq!(congestion_control_for(&qos), CongestionControl::Drop);
+        }
+    }
+
+    #[test]
+    fn test_congestion_reliable_keep_all_blocks() {
+        let qos = proto_qos(QosReliability::Reliable, QosHistory::KeepAll);
+        assert_eq!(
+            congestion_control_for(&qos),
+            zenoh::qos::CongestionControl::Block
+        );
+    }
+
+    #[test]
+    fn test_congestion_best_effort_always_drops() {
+        use zenoh::qos::CongestionControl;
+        for history in [QosHistory::KeepLast(1), QosHistory::KeepAll] {
+            let qos = proto_qos(QosReliability::BestEffort, history);
+            assert_eq!(congestion_control_for(&qos), CongestionControl::Drop);
+        }
+    }
+
+    #[test]
+    fn test_congestion_default_qos_drops() {
+        // hiroz's default profile is Reliable + KeepLast(10), like ROS 2's default.
+        let qos = crate::qos::QosProfile::default().to_protocol_qos();
+        assert_eq!(
+            congestion_control_for(&qos),
+            zenoh::qos::CongestionControl::Drop
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Topic name qualification (leading '/' is added when missing)
